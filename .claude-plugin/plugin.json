@@ -1,0 +1,9 @@
+{
+  "name": "avadbeta",
+  "version": "0.2",
+  "description": "AI builder plugin — strategy, review, design, QA, security, headless browser, deploy, and retrospectives.",
+  "author": {
+    "name": "Avad",
+    "email": "dev@avad.ai"
+  }
+}

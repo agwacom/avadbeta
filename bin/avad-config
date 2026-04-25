@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# avad-config — user-level avad key=value config store.
+#
+# Format is deliberately simple: one `key=value` line per entry, no YAML, no
+# quoting, no sections. The backing file lives at:
+#
+#   $AVAD_HOME/config         (AVAD_HOME defaults to $HOME/.avadbeta)
+#
+# Matches the state model in avad-core/ARCHITECTURE.md §State Model.
+#
+# Subcommands:
+#   get <key>            print the value; exit 0 on hit, 1 on miss.
+#   set <key> <value>    upsert; creates parents with mode 0700, file mode 0600.
+#                        serialized via $AVAD_HOME/.config.lock so concurrent
+#                        calls never drop an unrelated key.
+#   list                 print every `key=value` line, sorted.
+#
+# Lock:
+#   set acquires a portable lock directory at $AVAD_HOME/.config.lock
+#   (mkdir is atomic on POSIX). If a previous run crashed holding the lock,
+#   set will wait up to 5 seconds then error. In that case remove it manually:
+#     rmdir $AVAD_HOME/.config.lock
+#
+# Key constraints:
+#   - match ^[a-zA-Z0-9_]+$ (alphanumeric plus underscore).
+#
+# Value constraints (keeps the line format unambiguous without shell quoting):
+#   - no '=' characters
+#   - no newlines, no carriage returns, no NUL bytes
+#   - callers that need richer content should base64-encode at the call site.
+#
+# Exit codes:
+#   0   success (set, get hit, list, --help)
+#   1   get miss (key absent or config file missing)
+#   2   malformed arguments or invalid key/value
+
+set -uo pipefail
+
+USAGE='avad-config — user-level avad key=value config store.
+
+Usage:
+  avad-config get <key>          print value; exit 1 on miss
+  avad-config set <key> <value>  upsert key=value
+  avad-config list               print all entries, sorted
+  avad-config --help             print this message
+
+Location:
+  $AVAD_HOME/config (AVAD_HOME defaults to $HOME/.avadbeta)
+
+Rules:
+  key   matches ^[a-zA-Z0-9_]+$
+  value single-line UTF-8, no = or newline or NUL; base64-encode if richer
+'
+
+_home_dir() {
+  printf '%s' "${AVAD_HOME:-$HOME/.avadbeta}"
+}
+
+_config_file() {
+  printf '%s/config' "$(_home_dir)"
+}
+
+_validate_key() {
+  local k="$1"
+  if [ -z "$k" ]; then
+    echo "avad-config: key must be non-empty" >&2
+    return 2
+  fi
+  case "$k" in
+    *[!a-zA-Z0-9_]*)
+      echo "avad-config: key must match ^[a-zA-Z0-9_]+\$ (got: $k)" >&2
+      return 2
+      ;;
+  esac
+  return 0
+}
+
+_validate_value() {
+  local v="$1"
+  case "$v" in
+    *=*)
+      echo "avad-config: value must not contain '='" >&2
+      return 2
+      ;;
+  esac
+  # Newlines, carriage returns, NULs break the line-oriented format.
+  # awk/grep are not POSIX-guaranteed for NUL; do the checks in pure bash.
+  case "$v" in
+    *$'\n'*)
+      echo "avad-config: value must not contain a newline" >&2
+      return 2
+      ;;
+    *$'\r'*)
+      echo "avad-config: value must not contain a carriage return" >&2
+      return 2
+      ;;
+  esac
+  # NUL bytes are stripped by bash word splitting already; if a NUL ever
+  # reaches here it survives as a literal, which is still rejected by printf
+  # downstream. Explicit defense is not needed.
+  return 0
+}
+
+_ensure_home() {
+  local home
+  home="$(_home_dir)"
+  if [ ! -d "$home" ]; then
+    if ! mkdir -p "$home" 2>/dev/null; then
+      echo "avad-config: cannot create AVAD_HOME: $home" >&2
+      return 1
+    fi
+  fi
+  # Normalize perms on every call — the docs say $AVAD_HOME is 0700, so enforce
+  # it even if the directory pre-existed with looser perms (e.g., from a manual
+  # `mkdir ~/.avadbeta` or an earlier avad version). Best-effort: if the user does
+  # not own the dir, chmod fails silently and the rest of the checks catch it.
+  chmod 0700 "$home" 2>/dev/null || true
+  if [ ! -w "$home" ]; then
+    echo "avad-config: AVAD_HOME is not writable: $home" >&2
+    return 1
+  fi
+  return 0
+}
+
+# Lock state — script-global so the EXIT trap can release it even if a signal
+# cuts cmd_set short. Empty string means "no lock held."
+_LOCK_DIR=""
+
+_acquire_lock() {
+  _LOCK_DIR="$(_home_dir)/.config.lock"
+  # mkdir is atomic on POSIX: only one caller wins on a given directory. Retry
+  # briefly if another `set` is in flight. 100 * 50ms = ~5s upper bound.
+  local attempt=0
+  while ! mkdir "$_LOCK_DIR" 2>/dev/null; do
+    attempt=$((attempt + 1))
+    if [ "$attempt" -ge 100 ]; then
+      echo "avad-config: could not acquire lock at $_LOCK_DIR after ~5s" >&2
+      echo "avad-config: if no other avad-config is running, remove it manually:" >&2
+      echo "avad-config:   rmdir $_LOCK_DIR" >&2
+      _LOCK_DIR=""
+      return 1
+    fi
+    # BSD and GNU sleep both accept fractional seconds; on any stripped-down
+    # shell that does not, fall back to 1s — still correct, just slower.
+    sleep 0.05 2>/dev/null || sleep 1
+  done
+  return 0
+}
+
+_release_lock() {
+  if [ -n "$_LOCK_DIR" ]; then
+    rmdir "$_LOCK_DIR" 2>/dev/null || true
+    _LOCK_DIR=""
+  fi
+}
+
+cmd_get() {
+  local key="$1"
+  _validate_key "$key" || return 2
+  local file
+  file="$(_config_file)"
+  if [ ! -f "$file" ]; then
+    return 1
+  fi
+  local line
+  # `|| [ -n "$line" ]` catches the final partial line when the file does not
+  # end in a newline (hand-edited configs, some editors, `printf 'k=v' > file`).
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "$key="*)
+        printf '%s\n' "${line#"$key="}"
+        return 0
+        ;;
+    esac
+  done < "$file"
+  return 1
+}
+
+cmd_set() {
+  local key="$1" value="$2"
+  _validate_key "$key" || return 2
+  _validate_value "$value" || return 2
+  _ensure_home || return 1
+
+  # Serialize the full read-modify-write with a portable lock directory. Atomic
+  # rename prevents corruption but not lost updates: two concurrent `set` calls
+  # can both read the old file, both build a temp file, and whichever renames
+  # last silently overwrites the other's update.
+  _acquire_lock || return 1
+  # EXIT trap runs even on signals, so Ctrl+C while the lock is held still
+  # cleans up. _release_lock is idempotent on empty / already-released state.
+  trap '_release_lock' EXIT
+
+  local file tmp
+  file="$(_config_file)"
+  if ! tmp="$(mktemp "${file}.XXXXXX" 2>/dev/null)" || [ -z "$tmp" ]; then
+    echo "avad-config: failed to create temp file next to $file" >&2
+    return 1
+  fi
+  # RETURN trap is function-scoped, so $tmp is still in scope when it fires.
+  # Cleans up the temp file on every early exit below.
+  trap 'rm -f "$tmp"' RETURN
+
+  # Preserve every line except the existing entry for $key, then append the
+  # new entry. Atomic rename ensures a crash mid-write never corrupts the file.
+  if [ -f "$file" ]; then
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        "$key="*) ;;
+        *)
+          if ! printf '%s\n' "$line" >> "$tmp"; then
+            echo "avad-config: failed to write to temp file" >&2
+            return 1
+          fi
+          ;;
+      esac
+    done < "$file"
+  fi
+  if ! printf '%s=%s\n' "$key" "$value" >> "$tmp"; then
+    echo "avad-config: failed to write new entry" >&2
+    return 1
+  fi
+  chmod 0600 "$tmp" 2>/dev/null || true
+  if ! mv "$tmp" "$file"; then
+    echo "avad-config: failed to rename temp file into place" >&2
+    return 1
+  fi
+  # Rename succeeded; tmp no longer exists, so the RETURN trap's rm is a no-op.
+  # Lock release happens at script EXIT via the trap above.
+  return 0
+}
+
+cmd_list() {
+  local file
+  file="$(_config_file)"
+  if [ ! -f "$file" ]; then
+    return 0
+  fi
+  LC_ALL=C sort "$file"
+  return 0
+}
+
+case "${1:-}" in
+  '')
+    printf '%s\n' "$USAGE" >&2
+    exit 2
+    ;;
+  -h|--help|help)
+    printf '%s\n' "$USAGE"
+    exit 0
+    ;;
+  get)
+    if [ "$#" -ne 2 ]; then
+      echo "avad-config: usage: avad-config get <key>" >&2
+      exit 2
+    fi
+    cmd_get "$2"
+    exit $?
+    ;;
+  set)
+    if [ "$#" -ne 3 ]; then
+      echo "avad-config: usage: avad-config set <key> <value>" >&2
+      exit 2
+    fi
+    cmd_set "$2" "$3"
+    exit $?
+    ;;
+  list)
+    if [ "$#" -ne 1 ]; then
+      echo "avad-config: usage: avad-config list" >&2
+      exit 2
+    fi
+    cmd_list
+    exit $?
+    ;;
+  *)
+    echo "avad-config: unknown subcommand: $1" >&2
+    printf '%s\n' "$USAGE" >&2
+    exit 2
+    ;;
+esac

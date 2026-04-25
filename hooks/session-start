@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# SessionStart hook for the avad plugin on Claude Code.
+#
+# Reads hooks/bootstrap.md and emits it as `additionalContext` so Claude Code
+# loads the avad priority rules, voice, and entry command before the first
+# user message.
+#
+# This stays deliberately small. It is not a preamble. It does not probe the
+# repo, the branch, the base, or project docs. That work belongs to individual
+# avad skills when they run, not to every session start.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+BOOTSTRAP_FILE="${SCRIPT_DIR}/bootstrap.md"
+
+if [ ! -f "${BOOTSTRAP_FILE}" ]; then
+  # Fail quiet: emit empty context rather than breaking the session.
+  printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":""}}\n'
+  exit 0
+fi
+
+bootstrap_content="$(cat "${BOOTSTRAP_FILE}")"
+
+# JSON-escape the bootstrap content with bash parameter substitution. Same
+# technique as the Superpowers reference hook; avoids a heredoc and stays
+# compatible with bash 5.3+.
+escape_for_json() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/\\n}"
+  s="${s//$'\r'/\\r}"
+  s="${s//$'\t'/\\t}"
+  printf '%s' "$s"
+}
+
+escaped="$(escape_for_json "${bootstrap_content}")"
+
+# Claude Code consumes hookSpecificOutput.additionalContext. Copilot CLI reads
+# additionalContext at the top level. Emit the right shape based on env.
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -z "${COPILOT_CLI:-}" ]; then
+  printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"%s"}}\n' "${escaped}"
+else
+  printf '{"additionalContext":"%s"}\n' "${escaped}"
+fi
+
+exit 0
