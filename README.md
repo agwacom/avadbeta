@@ -39,8 +39,9 @@ avad-core/beta/
 
 The Codex subtree mirrors canonical `avad-core/codex-plugin/` exactly —
 canonical Codex has no `hooks/`, so beta Codex has no `hooks/`. The root
-adds experimental Codex marketplace metadata that points at `./codex-plugin`;
-trusted Codex activation still uses the AGENTS.md installer.
+adds experimental Codex marketplace metadata that points at the published
+`./codex-plugin` Git subdirectory; trusted Codex activation still uses the
+AGENTS.md installer.
 
 ## Differences from the canonical plugins
 
@@ -120,10 +121,12 @@ codex plugin marketplace add ~/.codex/avadbeta
 ```
 
 The marketplace path is for packaging and install validation only until Codex
-natural skill activation is proven. The appserver probe on this branch
-(`avad-core/docs/references/codex-appserver-install-discovery.md`) recorded
-PARTIAL-C: files install but the loader does not activate skills naturally
-in 0.125.0.
+natural skill activation is proven. The Codex marketplace entry uses
+`source: git-subdir`, so installing it through `/plugins` caches the plugin
+under the `avadbeta` marketplace with the manifest version. The appserver
+probe on this branch (`avad-core/docs/references/codex-appserver-install-discovery.md`)
+recorded PARTIAL-C: files install but the loader does not activate skills
+naturally in 0.125.0.
 
 ## Editing this directory
 

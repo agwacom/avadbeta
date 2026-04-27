@@ -7,8 +7,10 @@
     {
       "name": "avadbeta",
       "source": {
-        "source": "local",
-        "path": "./codex-plugin"
+        "source": "git-subdir",
+        "url": "https://github.com/agwacom/avadbeta.git",
+        "path": "./codex-plugin",
+        "ref": "main"
       },
       "policy": {
         "installation": "AVAILABLE",
