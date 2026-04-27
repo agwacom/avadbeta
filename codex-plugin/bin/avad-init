@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# avad-init — detect AVAD_ROOT and AVAD_HOST and emit shell-safe export lines.
+#
+# Designed to be sourced:
+#   eval "$(avad-init)"            # into the current shell
+#   source <(avad-init)            # same
+#
+# Keep this helper dependency-free and non-recursive: it must never invoke
+# avad-config, avad-base-branch, or any other avad helper. Skills rely on it
+# to succeed before any other runtime is resolved.
+#
+# Detection order (first hit wins):
+#   1. AVAD_ROOT and AVAD_HOST both already set (idempotent re-echo).
+#   2. CLAUDE_PLUGIN_ROOT set        → host=claude,   root=$CLAUDE_PLUGIN_ROOT.
+#   3. AVAD_CODEX_ROOT set           → host=codex,    root=$AVAD_CODEX_ROOT.
+#   4. Ancestor of the script path has .claude-plugin/plugin.json → claude.
+#   5. Ancestor of the script path has .codex-plugin/plugin.json  → codex.
+#   6. CODEX_HOME set (weak hint)    → host=codex,    root=<ancestor of bin/>.
+#   7. Fallback                      → host=unknown,  root=<ancestor of bin/>.
+#
+# Output formats:
+#   --format=shell (default) → `export KEY='value'` with POSIX single-quote escaping.
+#   --format=env             → `KEY=value` lines (no export, no quoting).
+#
+# Exit codes:
+#   0   on any successful resolution, including unknown host.
+#   2   on malformed arguments.
+
+set -uo pipefail
+
+USAGE='avad-init — emit shell-safe exports for AVAD_ROOT and AVAD_HOST.
+
+Usage:
+  eval "$(avad-init)"            source into current shell (recommended)
+  source <(avad-init)            same, via process substitution
+  avad-init --format=env         KEY=VALUE lines (no export, no quoting)
+  avad-init --help               print this message
+
+Detection order:
+  1. AVAD_ROOT and AVAD_HOST both set          → re-echo (idempotent)
+  2. CLAUDE_PLUGIN_ROOT set                    → claude
+  3. AVAD_CODEX_ROOT set                       → codex (explicit override)
+  4. ancestor dir has .claude-plugin/plugin.json → claude
+  5. ancestor dir has .codex-plugin/plugin.json  → codex
+  6. CODEX_HOME set (weak hint, host only)     → codex
+  7. otherwise                                 → unknown
+
+The host is always resolved; unknown is a valid result, not an error.
+'
+
+format=shell
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help|help)
+      printf '%s\n' "$USAGE"
+      exit 0
+      ;;
+    --format=shell) format=shell; shift ;;
+    --format=env)   format=env;   shift ;;
+    --format)
+      shift
+      case "${1:-}" in
+        shell) format=shell ;;
+        env)   format=env ;;
+        *)
+          echo "avad-init: --format expects shell|env" >&2
+          exit 2
+          ;;
+      esac
+      shift
+      ;;
+    *)
+      echo "avad-init: unknown argument: $1" >&2
+      printf '%s\n' "$USAGE" >&2
+      exit 2
+      ;;
+  esac
+done
+
+_sq() {
+  # POSIX-safe single-quote: wrap in ' and replace each embedded ' with '\''.
+  # Uses sed for deterministic escaping across bash 3.2 and 5.x; bash's own
+  # ${v//pat/rep} has subtle backslash-handling differences between versions.
+  local escaped
+  escaped=$(printf '%s' "$1" | sed "s/'/'\\\\''/g")
+  printf "'%s'" "$escaped"
+}
+
+_emit() {
+  local host="$1" root="$2"
+  case "$format" in
+    shell)
+      printf 'export AVAD_HOST=%s\n' "$(_sq "$host")"
+      printf 'export AVAD_ROOT=%s\n' "$(_sq "$root")"
+      ;;
+    env)
+      printf 'AVAD_HOST=%s\n' "$host"
+      printf 'AVAD_ROOT=%s\n' "$root"
+      ;;
+  esac
+}
+
+# 1. Idempotent re-echo if caller already resolved both values.
+if [ -n "${AVAD_ROOT:-}" ] && [ -n "${AVAD_HOST:-}" ]; then
+  _emit "$AVAD_HOST" "$AVAD_ROOT"
+  exit 0
+fi
+
+# 2. Claude runtime contract.
+if [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  _emit "claude" "$CLAUDE_PLUGIN_ROOT"
+  exit 0
+fi
+
+# 3. Codex explicit override.
+if [ -n "${AVAD_CODEX_ROOT:-}" ]; then
+  _emit "codex" "$AVAD_CODEX_ROOT"
+  exit 0
+fi
+
+# 4 + 5. Layout walk upward from the script path.
+_script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+_layout_host=""
+_layout_root=""
+_dir="$_script_dir"
+while :; do
+  if [ -f "$_dir/.claude-plugin/plugin.json" ]; then
+    _layout_host="claude"
+    _layout_root="$_dir"
+    break
+  fi
+  if [ -f "$_dir/.codex-plugin/plugin.json" ]; then
+    _layout_host="codex"
+    _layout_root="$_dir"
+    break
+  fi
+  if [ "$_dir" = "/" ] || [ -z "$_dir" ]; then
+    break
+  fi
+  _dir="$(dirname "$_dir")"
+done
+
+if [ -n "$_layout_host" ]; then
+  _emit "$_layout_host" "$_layout_root"
+  exit 0
+fi
+
+# 6 + 7 fallback: AVAD_ROOT = one directory up from bin/.
+_fallback_root="$(cd "$_script_dir/.." && pwd -P)"
+
+# 6. Weak CODEX_HOME hint: tags the host as codex, does not change the root.
+if [ -n "${CODEX_HOME:-}" ]; then
+  _emit "codex" "$_fallback_root"
+  exit 0
+fi
+
+# 7. Unknown host. Still a successful resolution.
+_emit "unknown" "$_fallback_root"
+exit 0

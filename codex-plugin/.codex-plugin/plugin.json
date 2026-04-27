@@ -1,0 +1,26 @@
+{
+  "name": "avadbeta",
+  "version": "0.3",
+  "description": "AI builder plugin — strategy, review, design, QA, security, headless browser, deploy, and retrospectives.",
+  "author": {
+    "name": "Avad",
+    "email": "dev@avad.ai"
+  },
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Avadbeta",
+    "shortDescription": "Pre-landing review and root-cause investigation skills with avad voice and discipline.",
+    "longDescription": "Avad packages serious-engineering AI workflows into a small set of named skills. The shipped surface today is /avadbeta-review (pre-landing review against the diff), /avadbeta-investigate (root-cause debugging), and /avadbeta-help (a read-only listing of shipped vs planned skills). Each skill ships with explicit voice rules, a completion protocol, and fix-first debugging discipline so behavior stays predictable across sessions. Run /avadbeta-help inside Codex for the current shipped-vs-planned listing.",
+    "developerName": "Avad",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "List available avad skills with /avadbeta-help"
+    ],
+    "brandColor": "#2563EB",
+    "screenshots": []
+  }
+}

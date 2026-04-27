@@ -8,12 +8,12 @@
     {
       "name": "avadbeta",
       "description": "AI builder plugin — strategy, review, design, QA, security, headless browser, deploy, and retrospectives.",
-      "version": "0.2",
+      "version": "0.3",
       "author": {
         "name": "Avad",
         "email": "dev@avad.ai"
       },
-      "source": "./",
+      "source": "./claude-plugin",
       "category": "productivity"
     }
   ]

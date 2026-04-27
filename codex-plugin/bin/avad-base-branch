@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# avad-base-branch — detect the base branch for the current repo.
+#
+# Prints exactly one branch name on stdout and exits 0. Never fails just
+# because `gh` is missing, there is no PR open, or the remote has no HEAD.
+#
+# Detection order (first hit wins):
+#   1. $AVAD_BASE_BRANCH non-empty (explicit caller override).
+#   2. gh PR signal: inside a PR branch, use the PR's baseRefName.
+#   3. git-native remote HEAD via `git symbolic-ref refs/remotes/origin/HEAD`.
+#   4. explicit remote refs: origin/dev, then origin/main, then origin/master.
+#   5. final fallback: "main".
+#
+# Exit codes:
+#   0   on any resolution, including the final "main" fallback.
+#   2   on malformed arguments.
+
+set -uo pipefail
+
+USAGE='avad-base-branch — print the base branch name for the current repo.
+
+Usage:
+  avad-base-branch                 print the detected base branch and exit 0
+  avad-base-branch --help          print this message
+
+Detection order:
+  1. $AVAD_BASE_BRANCH env var (explicit override)
+  2. gh PR baseRefName (when inside a PR and gh is authed)
+  3. git symbolic-ref refs/remotes/origin/HEAD
+  4. origin/dev, origin/main, origin/master (first one that exists)
+  5. "main" (final fallback)
+
+Never exits non-zero because gh is missing or the remote has no HEAD.
+'
+
+case "${1:-}" in
+  '') ;;
+  -h|--help|help)
+    printf '%s\n' "$USAGE"
+    exit 0
+    ;;
+  *)
+    echo "avad-base-branch: unknown argument: $1" >&2
+    printf '%s\n' "$USAGE" >&2
+    exit 2
+    ;;
+esac
+
+# 1. Explicit override.
+if [ -n "${AVAD_BASE_BRANCH:-}" ]; then
+  printf '%s\n' "$AVAD_BASE_BRANCH"
+  exit 0
+fi
+
+# 2. gh PR signal. All errors (gh missing, not authed, not in a PR, not in a
+#    git repo) fall through silently.
+if command -v gh >/dev/null 2>&1; then
+  gh_base=$(gh pr view --json baseRefName -q .baseRefName 2>/dev/null || true)
+  if [ -n "$gh_base" ]; then
+    printf '%s\n' "$gh_base"
+    exit 0
+  fi
+fi
+
+# 3. git-native remote HEAD. Works when `git remote set-head origin --auto`
+#    has been run (most clones do this on first fetch).
+sym=$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)
+if [ -n "$sym" ]; then
+  # Strip the refs/remotes/origin/ prefix without depending on GNU sed.
+  printf '%s\n' "${sym#refs/remotes/origin/}"
+  exit 0
+fi
+
+# 4. Check named remote branches in priority order.
+for candidate in dev main master; do
+  if git rev-parse --verify --quiet "refs/remotes/origin/$candidate" >/dev/null 2>&1; then
+    printf '%s\n' "$candidate"
+    exit 0
+  fi
+done
+
+# 5. Final fallback.
+printf 'main\n'
+exit 0

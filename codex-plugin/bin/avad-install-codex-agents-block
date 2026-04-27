@@ -1,0 +1,585 @@
+#!/usr/bin/env bash
+# avad-install-codex-agents-block - install the Codex AGENTS.md bootstrap block.
+#
+# This helper intentionally avoids Bun so it can run from a Codex plugin
+# install. Bash handles CLI, path checks, locks, and atomic renames; a small
+# Perl transform preserves target bytes outside the managed region.
+
+set -uo pipefail
+
+USAGE='avad-install-codex-agents-block - install avad bootstrap into Codex AGENTS.md.
+
+Usage:
+  avad-install-codex-agents-block [--scope project|user|both] [--target <dir>] [--codex-home <dir>] [--avad-root <dir>] [--check]
+  avad-install-codex-agents-block --help
+
+Defaults:
+  --scope project
+  --target current working directory
+  --codex-home $CODEX_HOME, or $HOME/.codex
+
+Exit codes:
+  0  current, installed, updated, or higher-version no-op in install mode
+  1  --check: install would be needed
+  2  --check: update or upgrade would be needed; malformed CLI usage otherwise
+  3  unsafe path, corrupt markers, source error, lock failure, write failure,
+     or --check found a higher-version installed block
+'
+
+_scope="project"
+_target="$PWD"
+if [ -n "${CODEX_HOME:-}" ]; then
+  _codex_home="$CODEX_HOME"
+elif [ -n "${HOME:-}" ]; then
+  _codex_home="$HOME/.codex"
+else
+  _codex_home=""
+fi
+_avad_root_arg=""
+_check=0
+
+_TMP_FILE=""
+_LOCK_DIR=""
+
+_cleanup() {
+  if [ -n "$_TMP_FILE" ]; then
+    rm -f "$_TMP_FILE" 2>/dev/null || true
+    _TMP_FILE=""
+  fi
+  if [ -n "$_LOCK_DIR" ]; then
+    rm -f "$_LOCK_DIR/pid" 2>/dev/null || true
+    rmdir "$_LOCK_DIR" 2>/dev/null || true
+    _LOCK_DIR=""
+  fi
+}
+
+trap '_cleanup' EXIT
+trap '_cleanup; exit 130' INT TERM
+
+_err() {
+  printf 'avad-install-codex-agents-block: %s\n' "$*" >&2
+}
+
+_has_newline() {
+  case "$1" in
+    *$'\n'*|*$'\r'*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_strip_trailing_slashes() {
+  local p="$1"
+  while [ "$p" != "/" ] && [ "${p%/}" != "$p" ]; do
+    p="${p%/}"
+  done
+  printf '%s' "$p"
+}
+
+_strip_trailing_dot_components() {
+  local p
+  p="$(_strip_trailing_slashes "$1")"
+  while [ "$p" != "/" ]; do
+    case "$p" in
+      */.)
+        p="${p%/.}"
+        p="$(_strip_trailing_slashes "$p")"
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+  printf '%s' "$p"
+}
+
+_usage_error() {
+  _err "$1"
+  printf '%s\n' "$USAGE" >&2
+  exit 2
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help|help)
+      printf '%s\n' "$USAGE"
+      exit 0
+      ;;
+    --check)
+      _check=1
+      shift
+      ;;
+    --uninstall)
+      _usage_error "--uninstall is not supported; delete the managed marker block manually"
+      ;;
+    --scope=*)
+      _scope="${1#--scope=}"
+      shift
+      ;;
+    --scope)
+      shift
+      [ "$#" -gt 0 ] || _usage_error "--scope expects project|user|both"
+      _scope="$1"
+      shift
+      ;;
+    --target=*)
+      _target="${1#--target=}"
+      shift
+      ;;
+    --target)
+      shift
+      [ "$#" -gt 0 ] || _usage_error "--target expects a directory"
+      _target="$1"
+      shift
+      ;;
+    --codex-home=*)
+      _codex_home="${1#--codex-home=}"
+      shift
+      ;;
+    --codex-home)
+      shift
+      [ "$#" -gt 0 ] || _usage_error "--codex-home expects a directory"
+      _codex_home="$1"
+      shift
+      ;;
+    --avad-root=*)
+      _avad_root_arg="${1#--avad-root=}"
+      shift
+      ;;
+    --avad-root)
+      shift
+      [ "$#" -gt 0 ] || _usage_error "--avad-root expects a directory"
+      _avad_root_arg="$1"
+      shift
+      ;;
+    *)
+      _usage_error "unknown argument: $1"
+      ;;
+  esac
+done
+
+case "$_scope" in
+  project|user|both) ;;
+  *) _usage_error "--scope expects project|user|both" ;;
+esac
+
+_canonical_dir() {
+  local label="$1" dir="$2"
+  if [ -z "$dir" ]; then
+    _err "$label is empty"
+    return 3
+  fi
+  if _has_newline "$dir"; then
+    _err "$label contains a newline"
+    return 3
+  fi
+  if [ ! -d "$dir" ]; then
+    _err "$label is not a directory: $dir"
+    return 3
+  fi
+  local resolved
+  if ! resolved="$(cd "$dir" 2>/dev/null && pwd -P)" || [ -z "$resolved" ]; then
+    _err "cannot resolve $label: $dir"
+    return 3
+  fi
+  if _has_newline "$resolved"; then
+    _err "resolved $label contains a newline: $resolved"
+    return 3
+  fi
+  printf '%s' "$resolved"
+}
+
+_resolve_avad_root() {
+  local candidate
+  if [ -n "$_avad_root_arg" ]; then
+    candidate="$_avad_root_arg"
+  elif [ -n "${AVAD_ROOT:-}" ]; then
+    candidate="$AVAD_ROOT"
+  else
+    local script_dir
+    if ! script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd -P)" || [ -z "$script_dir" ]; then
+      _err "cannot resolve helper bin directory"
+      return 3
+    fi
+    candidate="$script_dir/.."
+  fi
+  _canonical_dir "AVAD_ROOT" "$candidate"
+}
+
+_resolve_project_dir() {
+  local raw stripped
+  raw="$1"
+  if _has_newline "$raw"; then
+    _err "--target contains a newline"
+    return 3
+  fi
+  stripped="$(_strip_trailing_dot_components "$raw")"
+  if [ -L "$stripped" ]; then
+    _err "--target must not be a symlink: $raw"
+    return 3
+  fi
+  _canonical_dir "--target" "$raw"
+}
+
+_resolve_codex_home() {
+  local raw stripped
+  raw="$1"
+  if [ -z "$raw" ]; then
+    _err "--codex-home is empty and HOME/CODEX_HOME did not provide a default"
+    return 3
+  fi
+  if _has_newline "$raw"; then
+    _err "--codex-home contains a newline"
+    return 3
+  fi
+  stripped="$(_strip_trailing_dot_components "$raw")"
+  if [ -L "$stripped" ]; then
+    _err "--codex-home must not be a symlink: $raw"
+    return 3
+  fi
+  if [ -e "$raw" ] && [ ! -d "$raw" ]; then
+    _err "--codex-home exists but is not a directory: $raw"
+    return 3
+  fi
+  if [ ! -d "$raw" ]; then
+    if [ "$_check" -eq 1 ]; then
+      return 1
+    fi
+    if ! mkdir -p "$raw" 2>/dev/null; then
+      _err "cannot create --codex-home: $raw"
+      return 3
+    fi
+  fi
+  if [ -L "$stripped" ]; then
+    _err "--codex-home must not be a symlink: $raw"
+    return 3
+  fi
+  _canonical_dir "--codex-home" "$raw"
+}
+
+_acquire_lock() {
+  local agents="$1"
+  local lock_dir
+  lock_dir="${agents}.lock"
+  if ! mkdir "$lock_dir" 2>/dev/null; then
+    _err "could not acquire lock: $lock_dir"
+    return 3
+  fi
+  _LOCK_DIR="$lock_dir"
+  if ! printf '%s\n' "$$" > "$_LOCK_DIR/pid" 2>/dev/null; then
+    _err "could not write lock pid: $_LOCK_DIR/pid"
+    _cleanup
+    return 3
+  fi
+  return 0
+}
+
+_release_lock() {
+  if [ -n "$_LOCK_DIR" ]; then
+    rm -f "$_LOCK_DIR/pid" 2>/dev/null || true
+    rmdir "$_LOCK_DIR" 2>/dev/null || true
+    _LOCK_DIR=""
+  fi
+}
+
+_transform_agents() {
+  LC_ALL=C perl - "$@" <<'PERL'
+use strict;
+use warnings;
+use bytes;
+
+my ($source_path, $agents_path, $avad_root, $check, $tmp_path) = @ARGV;
+$check = $check eq '1' ? 1 : 0;
+
+sub msg {
+  my ($text) = @_;
+  print STDERR "avad-install-codex-agents-block: $text\n";
+}
+
+sub fail3 {
+  my ($text) = @_;
+  msg($text);
+  exit 3;
+}
+
+sub read_required {
+  my ($path, $label) = @_;
+  open my $fh, '<:raw', $path or fail3("cannot read $label: $path");
+  local $/;
+  my $data = <$fh>;
+  close $fh or fail3("cannot close $label after read: $path");
+  return defined($data) ? $data : '';
+}
+
+sub count_re {
+  my ($text, $re) = @_;
+  my $n = 0;
+  $n++ while $text =~ /$re/g;
+  return $n;
+}
+
+sub parse_source {
+  my ($source) = @_;
+
+  my @begins = ($source =~ /<!-- avad-bootstrap:begin (v[0-9][0-9]) -->/g);
+  my @ends = ($source =~ /<!-- avad-bootstrap:end (v[0-9][0-9]) -->/g);
+  my $begin_tokens = count_re($source, qr/avad-bootstrap:begin/);
+  my $end_tokens = count_re($source, qr/avad-bootstrap:end/);
+  fail3('source must contain exactly one avad-bootstrap begin marker')
+    unless @begins == 1 && $begin_tokens == 1;
+  fail3('source must contain exactly one avad-bootstrap end marker')
+    unless @ends == 1 && $end_tokens == 1;
+  fail3("source begin/end versions do not match: $begins[0] vs $ends[0]")
+    unless $begins[0] eq $ends[0];
+
+  my $body_begin = '<!-- BLOCK BODY BEGIN -->';
+  my $body_end = '<!-- BLOCK BODY END -->';
+  fail3('source must contain exactly one BLOCK BODY BEGIN fence')
+    unless count_re($source, qr/\Q$body_begin\E/) == 1;
+  fail3('source must contain exactly one BLOCK BODY END fence')
+    unless count_re($source, qr/\Q$body_end\E/) == 1;
+
+  $source =~ /\Q$body_begin\E(.*?)\Q$body_end\E/s
+    or fail3('source BODY fences are not ordered');
+  my $body = $1;
+  $body =~ s/\A(?:\r?\n)+//;
+  $body =~ s/(?:\r?\n)+\z//;
+  fail3('source block body is empty') if $body eq '';
+  return ($begins[0], $body);
+}
+
+sub version_num {
+  my ($v) = @_;
+  $v =~ /^v([0-9][0-9])$/ or fail3("invalid marker version: $v");
+  return int($1);
+}
+
+sub generated_block {
+  my ($version, $root, $body) = @_;
+  return "<!-- avad-bootstrap:begin $version -->\n"
+    . "# avad\n\n"
+    . "For this install, treat AVAD_ROOT as $root.\n\n"
+    . "$body\n"
+    . "<!-- avad-bootstrap:end $version -->\n";
+}
+
+sub write_tmp {
+  my ($tmp, $agents, $data) = @_;
+  open my $fh, '>:raw', $tmp or fail3("cannot write temp file: $tmp");
+  print {$fh} $data or fail3("cannot write temp file: $tmp");
+  close $fh or fail3("cannot close temp file: $tmp");
+  if (-e $agents) {
+    my @st = stat($agents);
+    chmod($st[2] & 07777, $tmp) if @st;
+  }
+}
+
+my $source = read_required($source_path, 'bootstrap source');
+my ($source_version, $body) = parse_source($source);
+my $wanted = generated_block($source_version, $avad_root, $body);
+
+my $data = '';
+if (-e $agents_path) {
+  $data = read_required($agents_path, 'AGENTS.md');
+}
+
+my @target_begins = ($data =~ /<!-- avad-bootstrap:begin (v[0-9][0-9]) -->/g);
+my @target_ends = ($data =~ /<!-- avad-bootstrap:end (v[0-9][0-9]) -->/g);
+my $target_begin_tokens = count_re($data, qr/avad-bootstrap:begin/);
+my $target_end_tokens = count_re($data, qr/avad-bootstrap:end/);
+
+if ($target_begin_tokens != @target_begins || $target_end_tokens != @target_ends) {
+  fail3('AGENTS.md contains a partial or unsupported avad bootstrap marker');
+}
+if (@target_begins != @target_ends) {
+  fail3('AGENTS.md contains unmatched avad bootstrap markers');
+}
+if (@target_begins > 1) {
+  fail3('AGENTS.md contains multiple avad bootstrap blocks');
+}
+
+if (@target_begins == 0) {
+  if ($check) {
+    exit 1;
+  }
+  my $new_data = length($data) == 0 ? $wanted : $data . "\n\n" . $wanted;
+  write_tmp($tmp_path, $agents_path, $new_data);
+  exit 10;
+}
+
+$data =~ /((<!-- avad-bootstrap:begin (v[0-9][0-9]) -->).*?(<!-- avad-bootstrap:end (v[0-9][0-9]) -->)(?:\r?\n)?)/s
+  or fail3('AGENTS.md bootstrap markers are corrupt or out of order');
+my $region = $1;
+my $begin_marker_start = $-[2];
+my $begin_marker_end = $+[2];
+my $end_marker_start = $-[4];
+my $end_marker_end = $+[4];
+my $installed_version = $3;
+my $installed_end_version = $5;
+my $region_start = $-[1];
+my $region_end = $+[1];
+
+fail3("AGENTS.md begin/end versions do not match: $installed_version vs $installed_end_version")
+  unless $installed_version eq $installed_end_version;
+
+if ($begin_marker_start > 0 && substr($data, $begin_marker_start - 1, 1) ne "\n") {
+  fail3('AGENTS.md begin marker is not on its own line');
+}
+if ($begin_marker_end < length($data)) {
+  my $next = substr($data, $begin_marker_end, 1);
+  fail3('AGENTS.md begin marker is not on its own line')
+    unless $next eq "\n" || $next eq "\r";
+}
+if ($end_marker_start > 0 && substr($data, $end_marker_start - 1, 1) ne "\n") {
+  fail3('AGENTS.md end marker is not on its own line');
+}
+if ($end_marker_end < length($data)) {
+  my $next = substr($data, $end_marker_end, 1);
+  fail3('AGENTS.md end marker is not on its own line')
+    unless $next eq "\n" || $next eq "\r";
+}
+
+my $installed_num = version_num($installed_version);
+my $source_num = version_num($source_version);
+if ($installed_num > $source_num) {
+  if ($check) {
+    msg("installed block version $installed_version is newer than source $source_version");
+    exit 3;
+  }
+  msg("warning: installed block version $installed_version is newer than source $source_version; leaving AGENTS.md unchanged");
+  exit 0;
+}
+
+if ($region eq $wanted) {
+  exit 0;
+}
+
+if ($check) {
+  exit 2;
+}
+
+my $new_data = substr($data, 0, $region_start) . $wanted . substr($data, $region_end);
+write_tmp($tmp_path, $agents_path, $new_data);
+exit 10;
+PERL
+}
+
+_process_target() {
+  local label="$1" dir="$2" avad_root="$3" source="$4"
+  local agents tmp code
+  agents="$dir/AGENTS.md"
+
+  if [ -L "$agents" ]; then
+    _err "$label AGENTS.md must not be a symlink: $agents"
+    return 3
+  fi
+  if [ -e "$agents" ] && [ ! -f "$agents" ]; then
+    _err "$label AGENTS.md exists but is not a regular file: $agents"
+    return 3
+  fi
+
+  _acquire_lock "$agents" || return 3
+
+  if ! tmp="$(mktemp "${agents}.tmp.XXXXXX" 2>/dev/null)" || [ -z "$tmp" ]; then
+    _err "failed to create temp file next to $agents"
+    _release_lock
+    return 3
+  fi
+  _TMP_FILE="$tmp"
+
+  _transform_agents "$source" "$agents" "$avad_root" "$_check" "$tmp"
+  code=$?
+
+  if [ "$_check" -eq 1 ]; then
+    rm -f "$tmp" 2>/dev/null || true
+    _TMP_FILE=""
+    _release_lock
+    return "$code"
+  fi
+
+  case "$code" in
+    0)
+      rm -f "$tmp" 2>/dev/null || true
+      _TMP_FILE=""
+      _release_lock
+      return 0
+      ;;
+    10)
+      if ! mv -f "$tmp" "$agents" 2>/dev/null; then
+        _err "failed to atomically replace $agents"
+        rm -f "$tmp" 2>/dev/null || true
+        _TMP_FILE=""
+        _release_lock
+        return 3
+      fi
+      _TMP_FILE=""
+      _release_lock
+      return 0
+      ;;
+    3)
+      rm -f "$tmp" 2>/dev/null || true
+      _TMP_FILE=""
+      _release_lock
+      return 3
+      ;;
+    *)
+      _err "internal transform failed with unexpected status $code"
+      rm -f "$tmp" 2>/dev/null || true
+      _TMP_FILE=""
+      _release_lock
+      return 3
+      ;;
+  esac
+}
+
+_avad_root="$(_resolve_avad_root)" || exit 3
+_source="$_avad_root/bootstrap/codex-agents-block.md"
+if [ -L "$_source" ]; then
+  _err "bootstrap source must not be a symlink: $_source"
+  exit 3
+fi
+if [ ! -f "$_source" ]; then
+  _err "bootstrap source is missing: $_source"
+  exit 3
+fi
+
+_worst=0
+
+_run_project() {
+  local dir status
+  dir="$(_resolve_project_dir "$_target")"
+  status=$?
+  [ "$status" -ne 0 ] && return "$status"
+  _process_target "project" "$dir" "$_avad_root" "$_source"
+  status=$?
+  return "$status"
+}
+
+_run_user() {
+  local dir status
+  dir="$(_resolve_codex_home "$_codex_home")"
+  status=$?
+  [ "$status" -ne 0 ] && return "$status"
+  _process_target "user" "$dir" "$_avad_root" "$_source"
+  status=$?
+  return "$status"
+}
+
+case "$_scope" in
+  project)
+    _run_project
+    exit $?
+    ;;
+  user)
+    _run_user
+    exit $?
+    ;;
+  both)
+    _run_project
+    _status=$?
+    [ "$_status" -gt "$_worst" ] && _worst="$_status"
+    _run_user
+    _status=$?
+    [ "$_status" -gt "$_worst" ] && _worst="$_status"
+    exit "$_worst"
+    ;;
+esac
