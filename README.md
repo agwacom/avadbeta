@@ -17,6 +17,9 @@ avad-core/beta/
 ├── README.md
 ├── .claude-plugin/
 │   └── marketplace.json          # root marketplace -> ./claude-plugin
+├── .agents/
+│   └── plugins/
+│       └── marketplace.json      # experimental Codex marketplace -> ./codex-plugin
 ├── claude-plugin/
 │   ├── .claude-plugin/plugin.json
 │   ├── bin/                      # avad-init, avad-config, avad-base-branch
@@ -35,9 +38,9 @@ avad-core/beta/
 ```
 
 The Codex subtree mirrors canonical `avad-core/codex-plugin/` exactly —
-canonical Codex has no `hooks/`, so beta Codex has no `hooks/`. It also
-does not yet ship `.agents/plugins/marketplace.json`; see "Codex
-marketplace deferral" below.
+canonical Codex has no `hooks/`, so beta Codex has no `hooks/`. The root
+adds experimental Codex marketplace metadata that points at `./codex-plugin`;
+trusted Codex activation still uses the AGENTS.md installer.
 
 ## Differences from the canonical plugins
 
@@ -48,7 +51,7 @@ both surfaces:
   `$HOME/.avad`, so beta state does not collide with a canonical install on
   the same machine.
 - Plugin manifests carry the beta version (`name: avadbeta`,
-  `version: 0.3`).
+  `version: 0.4`).
 - Skills are renamed under the `avadbeta-*` namespace (`avadbeta-help`,
   `avadbeta-investigate`, `avadbeta-review`) so commands do not collide
   with the canonical avad plugin or its inherited bridge.
@@ -101,6 +104,8 @@ field:
 
 After cloning to `~/.codex/avadbeta/`:
 
+Trusted activation path:
+
 ```
 ~/.codex/avadbeta/codex-plugin/bin/avad-install-codex-agents-block --scope user
 ```
@@ -108,14 +113,17 @@ After cloning to `~/.codex/avadbeta/`:
 This appends the avad bootstrap block to user-level `AGENTS.md`, which is
 the only delivery channel Codex 0.125.0 actually activates skills through.
 
-### Codex marketplace deferral
+Experimental marketplace install:
 
-A natural `marketplace.json`-based install path for Codex is deferred. The
-appserver probe on this branch
+```
+codex plugin marketplace add ~/.codex/avadbeta
+```
+
+The marketplace path is for packaging and install validation only until Codex
+natural skill activation is proven. The appserver probe on this branch
 (`avad-core/docs/references/codex-appserver-install-discovery.md`) recorded
 PARTIAL-C: files install but the loader does not activate skills naturally
-in 0.125.0. Beta will add `.agents/plugins/marketplace.json` once Codex
-supports natural marketplace activation post-0.125.0.
+in 0.125.0.
 
 ## Editing this directory
 
